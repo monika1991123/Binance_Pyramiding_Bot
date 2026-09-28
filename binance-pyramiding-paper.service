@@ -1,0 +1,21 @@
+[Unit]
+Description=Binance USD-M Pyramiding V2 10000U Paper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/Binance_Pyramiding_Bot
+Environment=BINANCE_PYRAMIDING_DATA_DIR=/home/ubuntu/Binance_Pyramiding_Bot/runtime-data
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 /home/ubuntu/Binance_Pyramiding_Bot/main.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+MemoryHigh=350M
+MemoryMax=500M
+
+[Install]
+WantedBy=default.target

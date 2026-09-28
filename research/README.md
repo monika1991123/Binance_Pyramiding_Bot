@@ -1,0 +1,23 @@
+# 原版只读审计与纸面配对对照
+
+运行：`python3 -B /home/ubuntu/Binance_Pyramiding_Bot/research/observer.py --watch`
+
+单次：`python3 -B /home/ubuntu/Binance_Pyramiding_Bot/research/observer.py`
+
+验证：`python3 -B /home/ubuntu/Binance_Pyramiding_Bot/research/test_observer.py`
+
+所有写入仅在 `research/output/`；不导入或实例化原版引擎，不读取密钥，不写原版账本，不修改原服务，不发送消息。使用文件锁拒绝重复进程。
+
+- 每15秒采样原版权益、持仓、行情健康；SQLite保存采样与完整成交档案，防止原版5000笔截断造成后续丢失。报告原子替换。
+- 公开资金费历史每标的最多15分钟增量更新一次，保留1小时重叠、分页去重。资金费按结算时有向持仓数量×结算标记价×费率计算；正费率多头付、空头收。API错误/限流进入冷却，缺失不冒充完整。
+- 最大净盈利周期的每次成交查询对应1分钟成交K线，保存原始响应。落在区间仅代表行情范围相容，不能证明盘口深度和成交真实性。
+- historical_paired：对已发生样本做配对归因；不是无前视回测，也不是未来收益。
+- forward_paired：启用后新开的周期，三组各10000U虚拟本金，既有持仓不迁入。原版滚仓、多头滚仓、不加仓共用原版实际成交机会和退出时间；不加仓首仓数量相同。不是各自重新选信号/退出/复利/保证金风控的独立策略机器人。
+- 两种期间的账本与持仓分别在report.json的comparisons下，不混合累计。交易费按实际使用数量比例计入，滑点已在原版价格里，资金费独立重算。
+- 原版持仓标记价格失败回退入场价无法从快照可靠识别；采样保留行情健康字段。历史未保存的权益曲线不能精确恢复。报告最大回撤只针对启用后的采样点，无法涵盖采样间峰谷。
+- 前向收益受资金费发布/轮询延迟影响，调整权益采样暂属暂定；资金费到达后按结算时刻回补历史采样，再重算回撤，原版未调整曲线独立保存。
+- 没有历史深度冲击、清算或真实成交保证，不把paper结果当实盘收益。
+
+输出：`output/report.md`、`report.json`、`winner-verification.json`、`funding.json`、`observer.sqlite3`、`health.json`、`source-hashes.json`。
+
+后台进程的PID记录在output/observer.pid；只启动这一观察器，不重启原版。主机重启后需重新启动观察器，本项目没有自动重载service白名单，不修改systemd。

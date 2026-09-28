@@ -18,7 +18,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 OUT = Path(__file__).resolve().parent / 'output'
 SOURCE = ROOT / 'runtime-data'
-VARIANTS = ('pyramiding', 'long_only', 'no_add')
+VARIANTS = ('pyramiding', 'long_only', 'no_add', 'cooldown_30m')
 CODE = ('config.py', 'strategy.py', 'paper_broker.py', 'main.py',
         'binance_market.py', 'storage.py', 'binance-pyramiding-paper.service')
 
@@ -54,6 +54,7 @@ def public_get(path, params):
 def replay(fills, funding, variant, cutoff, marks):
     cash = 10000.0
     positions, ledger, completed = {}, [], []
+    cooldown_until, skipped = {}, []
     fees = funding_net = gross = 0.0
     events = [(f['time'], 1, f) for f in fills if f['time'] >= cutoff]
     events += [(f['fundingTime'], 0, f) for f in funding if f['fundingTime'] >= cutoff]
@@ -75,6 +76,11 @@ def replay(fills, funding, variant, cutoff, marks):
         if not all(math.isfinite(x) and x > 0 for x in (source_qty, price)):
             raise ValueError('Invalid source fill')
         if action == 'ENTRY1':
+            if variant == 'cooldown_30m' and when < cooldown_until.get(symbol, 0):
+                skipped.append({'time': when, 'symbol': symbol, 'sourceOid': f['oid'],
+                                'reason': 'same_symbol_cooldown_30m',
+                                'cooldownUntil': cooldown_until[symbol]})
+                continue
             if variant == 'long_only' and f['side'] != 'BUY':
                 continue
             if pos:
@@ -112,6 +118,8 @@ def replay(fills, funding, variant, cutoff, marks):
                        'quantity': qty, 'price': price, 'fee': fee, 'closedPnl': closed_pnl, 'net': delta})
         if pos['sourceQuantity'] < 1e-8:
             completed.append({**pos, 'closedAt': when})
+            if variant == 'cooldown_30m':
+                cooldown_until[symbol] = when + 30 * 60000
             del positions[symbol]
     unreal = 0.0
     missing = []
@@ -134,6 +142,7 @@ def replay(fills, funding, variant, cutoff, marks):
             'unrealizedPnl': None if missing else unreal, 'realizedGrossPnl': gross,
             'fees': fees, 'fundingNet': funding_net, 'realizedNetPnl': cash - 10000,
             'positions': positions, 'ledger': ledger, 'completed': completed,
+            'skippedEntries': skipped, 'cooldownUntil': cooldown_until,
             'missingMarks': missing, 'closedCount': len(completed),
             'winRatePct': 100 * len(wins) / len(completed) if completed else None,
             'profitFactor': sum(wins) / -sum(losses) if losses else None,
@@ -255,6 +264,19 @@ def curve_stats(db, variant):
             'sampledMaxDrawdownPct': worst, 'peakEquity': peak}
 
 
+def cooldown_start(db):
+    key = 'forwardStart:cooldown_30m'
+    row = db.execute('SELECT value FROM meta WHERE key=?', (key,)).fetchone()
+    if row:
+        return int(row[0])
+    start = int(time.time() * 1000)
+    db.execute('INSERT INTO meta VALUES(?,?)', (key, str(start)))
+    db.execute('INSERT INTO curves(time,variant,equity) VALUES(?,?,?)',
+               (start, 'cooldown_30m', 10000.0))
+    db.commit()
+    return start
+
+
 def run_once(db):
     paper, runtime, fills = collect(db)
     until = runtime['generatedAt']
@@ -262,11 +284,13 @@ def run_once(db):
     if row is None:
         cutoff = int(time.time() * 1000)
         db.execute('INSERT INTO meta VALUES(?,?)', ('forwardStart', str(cutoff)))
-        for variant in VARIANTS:
+        for variant in VARIANTS[:-1]:
             db.execute('INSERT INTO curves(time,variant,equity) VALUES(?,?,?)', (cutoff, variant, 10000.0))
         db.commit()
     else:
         cutoff = int(row[0])
+    starts = {v: cutoff for v in VARIANTS}
+    starts['cooldown_30m'] = cooldown_start(db)
     marks = {p['symbol']: p['markPrice'] for p in runtime['positions']}
     # Source mark fallback is not independently detectable; retain this limitation in report.
     errors = []
@@ -289,9 +313,13 @@ def run_once(db):
             funding = [r for v in cache.values() for r in v['rows']]
     reports = {}
     for period, start in [('historical_paired', 0), ('forward_paired', cutoff)]:
-        reports[period] = {v: replay(fills, funding, v, start, marks) for v in VARIANTS}
+        reports[period] = {}
+        for v in VARIANTS:
+            effective_start = starts[v] if period == 'forward_paired' else start
+            reports[period][v] = {**replay(fills, funding, v, effective_start, marks),
+                                  'startedAt': effective_start}
     for v, account in reports['forward_paired'].items():
-        if account['equity'] is not None and not errors and until >= cutoff:
+        if account['equity'] is not None and not errors and until >= starts[v]:
             db.execute('INSERT OR REPLACE INTO curves VALUES(?,?,?,?)',
                        (until, v, account['equity'], account['fundingNet']))
         # Reapply late-published funding at its settlement time, not its fetch time.
@@ -316,12 +344,14 @@ def run_once(db):
         if str(exc).startswith('RATE_LIMIT:'):
             atomic(cooldown, {'until': time.time() + int(str(exc).split(':')[1])})
     result = {'generatedAt': until, 'timeUTC8': stamp(until), 'forwardStartUTC8': stamp(cutoff),
+              'forwardStartsUTC8': {v: stamp(t) for v, t in starts.items()},
               'sourceAccount': runtime['account'], 'sourceFills': len(fills),
               'sourceLedgerReconciled': True, 'fundingCheckedThrough': through,
               'errors': errors, 'winnerVerification': verification,
               'curves': {v: curve_stats(db, v) for v in (*VARIANTS, 'source_unadjusted')},
               'comparisons': reports,
               'limitations': ['Paper only; shared executed-entry/exit cohort, not all raw signals.',
+                'Cooldown group starts separately; compare matching periods, not lifetime totals across different start dates.',
                 'No-add uses same base quantity and source exits; no independent trailing or rescaling.',
                 'Historical paired results are in-sample counterfactuals, not forward results.',
                 'No historical equity recovery; observed sampled drawdown starts at observer launch.',
@@ -332,6 +362,7 @@ def run_once(db):
                 'Comparisons do not independently enforce margin or source risk gates; they isolate trade attribution.']}
     atomic(OUT / 'report.json', result)
     lines = ['# Binance 原版只读审计与配对对照', '', f'快照：{stamp(until)}；前向起点：{stamp(cutoff)}', '',
+             f'cooldown_30m 独立起点：{stamp(starts["cooldown_30m"])}；同币本组整仓退出后冷却30分钟，跳过的交易不延长冷却。', '',
              f'原版逐笔对账：通过；累计 {len(fills)} 笔。资金费查询截至：{stamp(through) if through else "不完整"}。', '']
     for period, accounts in reports.items():
         lines += [f'## {period}', '', '|组别|初始资金|权益|已实现净额含资金费|浮盈亏|手续费|资金费净额|结束周期|',
@@ -340,6 +371,7 @@ def run_once(db):
             num = lambda x: '缺失' if x is None else f'{x:.2f}'
             lines.append(f'|{name}|10000|{num(a["equity"])}|{a["realizedNetPnl"]:.2f}|{num(a["unrealizedPnl"])}|{a["fees"]:.2f}|{a["fundingNet"]:.2f}|{a["closedCount"]}|')
         lines.append('')
+    lines += [f'冷却组前向已跳过开仓：{len(reports["forward_paired"]["cooldown_30m"]["skippedEntries"])} 笔。明细见 report.json。', '']
     lines += ['## 启用以来采样权益最大回撤', '', '|组别|样本数|最大回撤|', '|---|---:|---:|']
     for name, c in result['curves'].items():
         lines.append(f'|{name}|{c["samples"]}|{c["sampledMaxDrawdownPct"]:.4f}%|')

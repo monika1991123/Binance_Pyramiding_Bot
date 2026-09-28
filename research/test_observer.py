@@ -1,7 +1,7 @@
 """Run: python3 -B research/test_observer.py. No network or production writes."""
 import tempfile
 from pathlib import Path
-from observer import replay, init_db, curve_stats
+from observer import replay, init_db, curve_stats, cooldown_start
 
 
 def fill(oid, action, qty, price, side='BUY', symbol='TEST'):
@@ -25,9 +25,31 @@ partial = fs[:2] + [fill(4, 'STOP_EXIT', 2, 120, 'SELL'), fill(5, 'RECONCILE_DUS
 assert abs(replay(partial, fund, 'no_add', 0, {})['cash'] - b['cash']) < 1e-8
 assert replay(fs[:1], [], 'pyramiding', 0, {})['equity'] is None
 assert replay(fs[:1], [], 'pyramiding', 0, {'TEST': 101})['unrealizedPnl'] == 2
+# Full exit starts cooldown; a skipped cycle's add/exit must not reset it.
+cool = [fill(1, 'ENTRY1', 2, 100), fill(2, 'STOP_EXIT', 1, 110, 'SELL'),
+        fill(3, 'STOP_EXIT', 1, 110, 'SELL'),
+        fill(4, 'ENTRY1', 2, 100, 'SELL'), fill(5, 'ADD1', 1, 90, 'SELL'),
+        fill(6, 'STOP_EXIT', 3, 80),
+        fill(7, 'ENTRY1', 1, 100, symbol='OTHER'),
+        fill(1802, 'ENTRY1', 1, 100), fill(1802.5, 'STOP_EXIT', 1, 110, 'SELL'),
+        fill(1803, 'ENTRY1', 1, 100)]
+c = replay(cool, [], 'cooldown_30m', 0, {'TEST': 101, 'OTHER': 101})
+assert [f['sourceOid'] for f in c['skippedEntries']] == [4, 1802]
+assert [f['sourceOid'] for f in c['ledger']] == [1, 2, 3, 7, 1803]
+assert c['cooldownUntil']['TEST'] == 1803000  # Exact boundary accepted, both directions blocked.
+assert abs(c['cash'] - (10000 + 20 - .21 - .05 - .05)) < 1e-8
+assert replay(cool, [], 'cooldown_30m', 0, {'TEST': 101, 'OTHER': 101}) == c
 with tempfile.TemporaryDirectory() as directory:
     db = init_db(Path(directory) / 'test.sqlite3')
     db.executemany('INSERT INTO curves(time,variant,equity) VALUES(?,?,?)', [(1, 'x', 100), (2, 'x', 120), (3, 'x', 90), (4, 'x', 110)])
     assert curve_stats(db, 'x')['sampledMaxDrawdownPct'] == 25
+    db.execute('INSERT INTO meta VALUES(?,?)', ('forwardStart', '123'))
+    start = cooldown_start(db)
+    db.close()
+    db = init_db(Path(directory) / 'test.sqlite3')
+    assert cooldown_start(db) == start
+    assert db.execute("SELECT value FROM meta WHERE key='forwardStart'").fetchone()[0] == '123'
+    assert db.execute("SELECT count(*) FROM curves WHERE variant='cooldown_30m'").fetchone()[0] == 1
     db.close()
 print('PASS: funding signs, fees, paired sizing, partial exits, cutoff, missing marks, drawdown')
+print('PASS: cooldown boundary, partial close, skipped-cycle isolation, other symbols, persistent independent start')

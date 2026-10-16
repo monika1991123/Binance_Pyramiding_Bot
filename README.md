@@ -15,7 +15,7 @@
 - Variant C：+0.75R 先抬止损到首仓附近，再加 0.75× Base；+1.50R 再先抬止损到约 +1R，再加 0.50× Base。
 - 第二次加仓后进入 2.20 ATR trailing；止损只允许向盈利方向收紧。
 - **亏损方向永不加仓。**
-- 日内权益损失 ≥ 5%：停止新开仓；Peak Drawdown ≥ 15%：Kill 锁定新开仓。
+- 日内权益损失 ≥ 5%：停止新开仓；Peak Drawdown Kill 阈值仍为 15%，但 Paper 前向阶段当前通过 `drawdown_kill_enabled=False` 暂时关闭，可随时恢复。
 - 重启会对 Paper position / Campaign / protective stop 做一致性检查；不一致时禁止新开仓。
 
 ## 限流设计

@@ -37,7 +37,9 @@ class Settings:
     max_positions: int = 12
     max_same_direction: int = 8
     max_drawdown_pct: float = 15.0
+    drawdown_kill_enabled: bool = False  # Paper 前向阶段暂时关闭 Peak Drawdown Kill
     daily_loss_pct: float = 5.0
+    daily_loss_gate_enabled: bool = False  # Paper 测试阶段暂时关闭日亏损 5% 开仓门禁；仍保留统计
     max_leverage: float = 5.0
     scan_grace_seconds: int = 8
     manage_interval_seconds: int = 3

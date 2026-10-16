@@ -306,36 +306,60 @@ class BinanceFuturesMarket:
         except Exception as exc:
             self.ws_market_last_error = f"decode: {exc}"
 
-    def _ws_worker(self, category: str) -> None:
+    def _ws_worker(self, category: str, stop: threading.Event, symbols: List[str]) -> None:
+        def current_callback(callback):
+            def guarded(*args):
+                with self.lock:
+                    if not stop.is_set() and self.ws_stop is stop:
+                        callback(*args)
+                    elif callback in (self._on_public_open, self._on_market_open):
+                        # close() may have raced with run_forever() starting up.
+                        args[0].close()
+            return guarded
+
         backoff = 1.0
-        while not self.ws_stop.is_set():
-            symbols = list(self.ws_symbols)
+        while not stop.is_set():
             if not symbols:
                 return
             if category == "public":
                 streams = [f"{symbol.lower()}@bookTicker" for symbol in symbols]
                 url = self.cfg.ws_public_base + "/".join(streams)
-                app = websocket.WebSocketApp(url, on_open=self._on_public_open, on_message=self._on_public_message,
-                                             on_error=self._on_public_error, on_close=self._on_public_close)
-                self.ws_public_app = app
+                app = websocket.WebSocketApp(url, on_open=current_callback(self._on_public_open),
+                                             on_message=current_callback(self._on_public_message),
+                                             on_error=current_callback(self._on_public_error),
+                                             on_close=current_callback(self._on_public_close))
             else:
                 streams = [f"{symbol.lower()}@markPrice@1s" for symbol in symbols]
                 url = self.cfg.ws_market_base + "/".join(streams)
-                app = websocket.WebSocketApp(url, on_open=self._on_market_open, on_message=self._on_market_message,
-                                             on_error=self._on_market_error, on_close=self._on_market_close)
-                self.ws_market_app = app
+                app = websocket.WebSocketApp(url, on_open=current_callback(self._on_market_open),
+                                             on_message=current_callback(self._on_market_message),
+                                             on_error=current_callback(self._on_market_error),
+                                             on_close=current_callback(self._on_market_close))
+            with self.lock:
+                if stop.is_set():
+                    return
+                if category == "public":
+                    self.ws_public_app = app
+                else:
+                    self.ws_market_app = app
             try:
                 app.run_forever(ping_interval=120, ping_timeout=30)
             except Exception as exc:
-                if category == "public":
-                    self.ws_public_last_error = str(exc)
-                else:
-                    self.ws_market_last_error = str(exc)
-            if category == "public":
-                self.ws_public_connected = False
-            else:
-                self.ws_market_connected = False
-            if self.ws_stop.wait(backoff):
+                with self.lock:
+                    if not stop.is_set():
+                        if category == "public":
+                            self.ws_public_last_error = str(exc)
+                        else:
+                            self.ws_market_last_error = str(exc)
+            finally:
+                app.close()
+            with self.lock:
+                if self.ws_stop is stop:
+                    if category == "public":
+                        self.ws_public_connected = False
+                    else:
+                        self.ws_market_connected = False
+            if stop.wait(backoff):
                 break
             backoff = min(30.0, backoff * 1.8)
 
@@ -347,17 +371,20 @@ class BinanceFuturesMarket:
             return
         self.stop_streams()
         self.ws_symbols = wanted
-        self.ws_stop.clear()
+        # Each generation owns its stop event; timed-out old workers stay stopped.
+        self.ws_stop = threading.Event()
         if not wanted:
             return
-        self.ws_public_thread = threading.Thread(target=self._ws_worker, args=("public",), name="binance-public-ws", daemon=True)
-        self.ws_market_thread = threading.Thread(target=self._ws_worker, args=("market",), name="binance-market-ws", daemon=True)
+        self.ws_public_thread = threading.Thread(target=self._ws_worker, args=("public", self.ws_stop, wanted), name="binance-public-ws", daemon=True)
+        self.ws_market_thread = threading.Thread(target=self._ws_worker, args=("market", self.ws_stop, wanted), name="binance-market-ws", daemon=True)
         self.ws_public_thread.start()
         self.ws_market_thread.start()
 
     def stop_streams(self) -> None:
-        self.ws_stop.set()
-        for app in (self.ws_public_app, self.ws_market_app):
+        with self.lock:
+            self.ws_stop.set()
+            apps = (self.ws_public_app, self.ws_market_app)
+        for app in apps:
             if app is not None:
                 try:
                     app.close()
@@ -372,7 +399,6 @@ class BinanceFuturesMarket:
         self.ws_market_thread = None
         self.ws_public_connected = False
         self.ws_market_connected = False
-        self.ws_stop.clear()
 
     def status(self) -> dict:
         with self.lock:

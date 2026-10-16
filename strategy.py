@@ -314,14 +314,16 @@ class PyramidingEngine:
             risk["dailyKey"] = day
         drawdown_pct = max(0.0, (peak - equity) / peak * 100.0) if peak > 0 else 0.0
         daily_loss_pct = max(0.0, (daily_start - equity) / daily_start * 100.0) if daily_start > 0 else 0.0
-        kill = bool(risk.get("drawdownKillActive")) or drawdown_pct >= self.cfg.max_drawdown_pct
+        kill = (
+            bool(risk.get("drawdownKillActive")) or drawdown_pct >= self.cfg.max_drawdown_pct
+        ) if self.cfg.drawdown_kill_enabled else False
         risk.update({
             "peakEquity": peak,
             "dailyStartBalance": daily_start,
             "drawdownKillActive": kill,
             "drawdownPct": drawdown_pct,
             "dailyLossPct": daily_loss_pct,
-            "dailyLossHit": daily_loss_pct >= self.cfg.daily_loss_pct,
+            "dailyLossHit": self.cfg.daily_loss_gate_enabled and daily_loss_pct >= self.cfg.daily_loss_pct,
             "equity": equity,
             "openRiskUsd": self._open_risk(),
             "openRiskCapUsd": min(self.cfg.max_open_risk_usd, equity * self.cfg.max_portfolio_risk_pct / 100.0),
@@ -684,7 +686,9 @@ class PyramidingEngine:
                 "maxPositions": self.cfg.max_positions,
                 "maxSameDirection": self.cfg.max_same_direction,
                 "maxDrawdownPct": self.cfg.max_drawdown_pct,
+                "drawdownKillEnabled": self.cfg.drawdown_kill_enabled,
                 "dailyLossPct": self.cfg.daily_loss_pct,
+                "dailyLossGateEnabled": self.cfg.daily_loss_gate_enabled,
                 "maxLeverage": self.cfg.max_leverage,
                 "feeBps": self.cfg.fee_bps,
                 "slippageBps": self.cfg.slippage_bps,
